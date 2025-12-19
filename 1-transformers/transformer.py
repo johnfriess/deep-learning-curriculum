@@ -124,7 +124,7 @@ for epoch in range(1):
         targets = seq[1:]
         optimizer.zero_grad()
         logits = model(x)
-        loss = torch.nn.functional.F.cross_entropy(logits, targets)
+        loss = torch.nn.functional.cross_entropy(logits, targets)
         loss.backward()
         optimizer.step()
 
