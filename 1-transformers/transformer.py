@@ -6,23 +6,28 @@ from jaxtyping import Int, Float
 class Attention(torch.nn.Module):
     def __init__(self, d_model=64, d_k=16, d_v=16, n_heads=1):
         super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
         self.d_k = d_k
-        self.w_q = torch.nn.Parameter(torch.randn(d_model, d_k))
-        self.w_k = torch.nn.Parameter(torch.randn(d_model, d_k))
-        self.w_v = torch.nn.Parameter(torch.randn(d_model, d_v))
-        self.w_o = torch.nn.Parameter(torch.randn(d_v, d_model))
+        self.d_v = d_v
+        self.w_q = torch.nn.Parameter(torch.randn(n_heads, d_model, d_k))
+        self.w_k = torch.nn.Parameter(torch.randn(n_heads, d_model, d_k))
+        self.w_v = torch.nn.Parameter(torch.randn(n_heads, d_model, d_v))
+        self.w_o = torch.nn.Parameter(torch.randn(n_heads * d_v, d_model))
 
     def forward(self, q: Float[torch.Tensor, "token d_model"], k: Float[torch.Tensor, "token d_model"], v: Float[torch.Tensor, "token d_model"]) -> Float[torch.Tensor, "token d_model"]:
+        n, d_model = q.shape
         q = q @ self.w_q
         k = k @ self.w_k
         v = v @ self.w_v
-        logits = (q @ k.t()) / (self.d_k ** 0.5)
+        logits = (q @ k.transpose(1, 2)) / (self.d_k ** 0.5)
         logits = self.mask(logits)
-        o = torch.softmax(logits, dim=1) @ v
-        return o @ self.w_o
+        o = torch.softmax(logits, dim=2) @ v
+        o = o.permute(1, 0, 2)
+        return o.reshape(n, self.n_heads * self.d_v) @ self.w_o
 
-    def mask(self, x: Float[torch.Tensor, "token token"]) -> Float[torch.Tensor, "token token"]:
-        n, n = x.shape
+    def mask(self, x: Float[torch.Tensor, "n_head token token"]) -> Float[torch.Tensor, "n_head token token"]:
+        n_heads, n, n = x.shape
         i, j = torch.meshgrid(
             torch.arange(n),
             torch.arange(n),
@@ -104,13 +109,12 @@ tokens = tokenize(content)
 stoi, itos = build_vocab(tokens)
 vocab_size = len(stoi)
 
-model = Transformer(d_model=8, d_k=4, vocab_size=vocab_size)
+model = Transformer(d_model=32, d_k=12, d_v=12, n_heads=4, vocab_size=vocab_size)
 optimizer = torch.optim.Adam(model.parameters())
 seq_len = 32
-print(len(tokens))
 for epoch in range(1):
     print(f"training epoch {epoch}")
-    for i in range(0, 100000, seq_len):
+    for i in range(0, len(tokens), seq_len):
         print(f"training seq start {i}")
         start, end = i, i+seq_len
         if end > len(tokens):
@@ -120,28 +124,32 @@ for epoch in range(1):
         targets = seq[1:]
         optimizer.zero_grad()
         logits = model(x)
-        loss = torch.functional.F.cross_entropy(logits, targets)
+        loss = torch.nn.functional.F.cross_entropy(logits, targets)
         loss.backward()
         optimizer.step()
 
 with torch.no_grad():
-    for _ in range(5):
-        start = ["By", "unions", "married", "do", "offend", "thine"]
-        for _ in range(20):
+    # test auto-regressiveness
+    for _ in range(1):
+        start = ["In", "singleness", "the", "parts", "that", "thou"]
+        for _ in range(1):
             x = torch.as_tensor(numericalize(start, stoi))
             logits = model(x)
             probs = torch.softmax(logits[-1], dim=-1)
+            topk = torch.topk(probs, 20)
+            print([(itos[i.item()], float(p)) for i, p in zip(topk.indices, topk.values)])
             next_word = itos[torch.multinomial(probs, 1).item()]
             start.append(next_word)
         print(start)
 
-    # for i in range(1000, 1100, seq_len):
-    #     start, end = i, i+seq_len
-    #     if end > len(tokens):
-    #         continue
+    # test predictions on sequences
+    for i in range(1000, 1100, seq_len):
+        start, end = i, i+seq_len
+        if end > len(tokens):
+            continue
 
-    #     x = torch.as_tensor(numericalize(tokens[start:end], stoi))
-    #     logits = model(x)
-    #     probs = torch.softmax(logits[-1], dim=-1)
-    #     next_word = itos[torch.multinomial(probs, 1).item()]
-    #     print(f"sequence: {" ".join(tokens[start:end])}, predicted: {next_word}")
+        x = torch.as_tensor(numericalize(tokens[start:end], stoi))
+        logits = model(x)
+        probs = torch.softmax(logits[-1], dim=-1)
+        next_word = itos[torch.multinomial(probs, 1).item()]
+        print(f"sequence: {" ".join(tokens[start:end])}, predicted: {next_word}")
