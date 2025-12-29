@@ -1,4 +1,4 @@
-env: "CartPole-v1"
+env: CartPole-v1
 gamma: 0.999
 lam: 0.95
 timesteps_per_rollout: 256
@@ -7,7 +7,7 @@ minibatches_per_rollout: 8
 entropy_bonus: 0.01
 epsilon: 0.2
 reward_norm: true
-lr: 5e-4
+lr: 0.0005
 workers: 1
 env_per_worker: 64
-total_timesteps: 3000 # 25e6
+total_timesteps: 3000
