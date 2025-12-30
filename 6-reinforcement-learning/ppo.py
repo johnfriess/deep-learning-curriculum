@@ -34,13 +34,27 @@ class PPO(torch.nn.Module):
         state = self.forward(state)
         return self.policy(state)
 
-    def get_action(self, state: Float[torch.Tensor, "batch obs_dim1 obs_dim2 ..."]) -> Float[torch.Tensor, "batch action"]:
+    def get_action(self, state: Float[torch.Tensor, "batch obs_dim1 obs_dim2 ..."]) -> tuple[Float[torch.Tensor, "batch"], Float[torch.Tensor, "batch"], Float[torch.Tensor, "batch"]]:
         state = self.forward(state)
         logits = self.policy(state)
         probs = torch.softmax(logits, dim=1)
-        action = torch.multinomial(probs, num_samples=1)
-        return action, torch.log(probs.gather(dim=1, index=action)), self.value(state)
+
+        action = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        logp = torch.log(probs.gather(dim=1, index=action.unsqueeze(-1))).squeeze(-1)
+        value = self.value(state).squeeze(-1)
+
+        return action, logp, value
     
+    def evaluate_action(self, state: Float[torch.Tensor, "batch obs_dim1 obs_dim2 ..."], action: Float[torch.Tensor, "batch"]) -> tuple[Float[torch.Tensor, "batch"], Float[torch.Tensor, "batch"]]:
+        state = self.forward(state)
+        logits = self.policy(state)
+        probs = torch.softmax(logits, dim=1)
+
+        logp = torch.log(probs.gather(dim=1, index=action.unsqueeze(-1))).squeeze(-1)
+        value = self.value(state).squeeze(-1)
+
+        return logp, value
+
     def compute_clip_loss(self, logp: Float[torch.Tensor, "t"], logp_old: Float[torch.Tensor, "t"], advantage: Float[torch.Tensor, "t"]) -> Float[torch.Tensor, "t"]:
         ratio = torch.exp(logp - logp_old)
         return torch.minimum(ratio * advantage, torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantage)
@@ -68,69 +82,74 @@ def main(config):
         action_dim=action_dim,
         epsilon=config.epsilon
     )
+    model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), config.lr)
 
     total_timesteps = 0
     while total_timesteps < config.total_timesteps:
-        optimizer.zero_grad()
+        print("next rollout:")
 
         # collect TIMESTEPS_PER_ROLLOUT
-        state = [obs]
-        reward = []
-        logp_old = []
-        value_old = []
-        mask = []
-        for _ in range(config.timesteps_per_rollout):
-            action, logp, v = model.get_action(obs)
-            next_obs, r, terminated, truncated, info = env.step(action.item())
+        states = torch.empty(config.timesteps_per_rollout, obs_dim, device=device)
+        actions = torch.empty(config.timesteps_per_rollout, dtype=torch.long, device=device)
+        rewards = torch.empty(config.timesteps_per_rollout, device=device)
+        logp_old = torch.empty(config.timesteps_per_rollout, device=device)
+        values_old = torch.empty(config.timesteps_per_rollout + 1, device=device)
+        mask = torch.empty(config.timesteps_per_rollout, device=device)
+        with torch.no_grad():
+            for t in range(config.timesteps_per_rollout):
+                action, logp, value = model.get_action(obs)
+                next_obs, reward, terminated, truncated, info = env.step(action.item())
 
-            logp_old.append(logp)
-            value_old.append(v)
-            reward.append(r)
-            mask.append(0 if terminated or truncated else 1)
-            
-            if terminated or truncated:
-                obs, info = env.reset()
-            else:
-                obs = next_obs
-            state.append(obs)
-            
-            total_timesteps += 1
+                states[t] = torch.as_tensor(obs, device=device)
+                actions[t] = action.item()
+                logp_old[t] = logp
+                values_old[t] = value
+                rewards[t] = reward
 
-        advantage = [0]
-        for t in range(config.timesteps_per_rollout-2, -1, -1):
-            delta = reward[t] + config.gamma * mask[t] * value_old[t+1] - value_old[t]
-            advantage.append(delta + config.gamma * config.lam * mask[t] * advantage[-1])
-        advantage = advantage[::-1]
-        advantage.pop()
+                if terminated or truncated:
+                    mask[t] = 0
+                    obs, info = env.reset()
+                else:
+                    mask[t] = 1
+                    obs = next_obs
+                
+                total_timesteps += 1
+            _, _, value = model.get_action(obs)
+            values_old[config.timesteps_per_rollout] = value
 
-        state = torch.as_tensor(state, device=device)
-        advantage = torch.as_tensor(advantage, device=device)
-        logp_old = torch.as_tensor(logp_old, device=device)
-        value_old = torch.as_tensor(value_old, device=device)
+            advantages = torch.empty(config.timesteps_per_rollout, device=device)
+            advantage_next = 0
+            for t in range(config.timesteps_per_rollout-1, -1, -1):
+                delta = rewards[t] + config.gamma * mask[t] * values_old[t+1] - values_old[t]
+                advantages[t] = delta + config.gamma * config.lam * mask[t] * advantage_next
+                advantage_next = advantages[t]
 
         # update policy
         for epoch in range(config.epochs_per_rollout):
-            idx = torch.randperm(config.timesteps_per_rollout-1)
-            for start in range(0, config.timesteps_per_rollout, config.minibatches_per_rollout):
-                batch_idx = idx[start:start + config.minibatches_per_rollout]
+            idx = torch.randperm(config.timesteps_per_rollout, device=device)
+            batch_size = config.timesteps_per_rollout // config.minibatches_per_rollout
+            for start in range(0, config.timesteps_per_rollout, batch_size):
+                optimizer.zero_grad()
+                batch_idx = idx[start:start + batch_size]
 
-                batch_state = state[batch_idx]
+                batch_actions = actions[batch_idx]
+                batch_states = states[batch_idx]
                 batch_logp_old = logp_old[batch_idx]
-                batch_value_old = value_old[batch_idx]
-                batch_advantage = advantage[batch_idx]
+                batch_values_old = values_old[batch_idx]
+                batch_advantages = advantages[batch_idx]
 
-                batch_action, batch_logp, batch_value = model.get_action(batch_state)
+                batch_logp, batch_value = model.evaluate_action(batch_states, batch_actions)
 
                 clip_loss = model.compute_clip_loss(
                     logp=batch_logp,
                     logp_old=batch_logp_old,
-                    advantage=batch_advantage
+                    advantage=batch_advantages
                 )
                 vf_loss = model.compute_vf_loss(
                     value=batch_value,
-                    advantage=batch_advantage,
-                    value_old=batch_value_old
+                    advantage=batch_advantages,
+                    value_old=batch_values_old
                 )
                 loss = model.compute_loss(clip_loss, vf_loss)
                 print(f"timestep: {total_timesteps}, epoch: {epoch}, loss: {loss}")
