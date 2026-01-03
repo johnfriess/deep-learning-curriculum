@@ -1,17 +1,19 @@
 import torch
 import hydra
-import gymnasium as gym
-from gymnasium.spaces.utils import flatdim
+import gym
+from gym.spaces.utils import flatdim
 from jaxtyping import Int, Float
 
+import glfw
+glfw.ERROR_REPORTING = "warn"
+
 class PPO(torch.nn.Module):
-    def __init__(self, device=None, obs_dim=4, hidden_dim=64, action_dim=2, epsilon=0.2, entropy_bonus=0.01, c1=0.5, c2=0.01):
+    def __init__(self, device=None, obs_dim=4, hidden_dim=64, action_dim=2, epsilon=0.2, c1=0.5, c2=0.01):
         super().__init__()
         self.device = device
         self.epsilon = epsilon
         self.c1 = c1
         self.c2 = c2
-        self.entropy_bonus = entropy_bonus
         self.encoder = torch.nn.Sequential(
             torch.nn.Linear(obs_dim, hidden_dim),
             torch.nn.ReLU(),
@@ -24,8 +26,12 @@ class PPO(torch.nn.Module):
     def forward(self, state: Float[torch.Tensor, "batch obs_dim1 obs_dim2 ..."]) -> Float[torch.Tensor, "batch hidden_dim"]:
         if not isinstance(state, torch.Tensor):
             state = torch.as_tensor(state, device=self.device)
+        if state.dtype != torch.float:
+            state = state.float()
         if state.ndim == 1:
             state = state.unsqueeze(0)
+        if state.dtype == torch.uint8:
+            state = state / 255.0
         B = state.shape[0]
         state = state.view(B, -1)
         return self.encoder(state)
@@ -37,7 +43,7 @@ class PPO(torch.nn.Module):
     def get_action(self, state: Float[torch.Tensor, "batch obs_dim1 obs_dim2 ..."]) -> tuple[Float[torch.Tensor, "batch"], Float[torch.Tensor, "batch"], Float[torch.Tensor, "batch"]]:
         state = self.forward(state)
         logits = self.policy(state)
-        probs = torch.softmax(logits, dim=1)
+        probs = torch.softmax(logits, dim=1).clamp_min(1e-8)
 
         action = torch.multinomial(probs, num_samples=1).squeeze(-1)
         logp = torch.log(probs.gather(dim=1, index=action.unsqueeze(-1))).squeeze(-1)
@@ -45,15 +51,16 @@ class PPO(torch.nn.Module):
 
         return action, logp, value
     
-    def evaluate_action(self, state: Float[torch.Tensor, "batch obs_dim1 obs_dim2 ..."], action: Float[torch.Tensor, "batch"]) -> tuple[Float[torch.Tensor, "batch"], Float[torch.Tensor, "batch"]]:
+    def evaluate_action(self, state: Float[torch.Tensor, "batch obs_dim1 obs_dim2 ..."], action: Float[torch.Tensor, "batch"]) -> tuple[Float[torch.Tensor, "batch"], Float[torch.Tensor, "batch"], Float[torch.Tensor, "batch"]]:
         state = self.forward(state)
         logits = self.policy(state)
-        probs = torch.softmax(logits, dim=1)
+        probs = torch.softmax(logits, dim=1).clamp_min(1e-8)
+        entropy = -torch.sum(probs * torch.log(probs), dim=1)
 
         logp = torch.log(probs.gather(dim=1, index=action.unsqueeze(-1))).squeeze(-1)
         value = self.value(state).squeeze(-1)
 
-        return logp, value
+        return logp, entropy, value
 
     def compute_clip_loss(self, logp: Float[torch.Tensor, "t"], logp_old: Float[torch.Tensor, "t"], advantage: Float[torch.Tensor, "t"]) -> Float[torch.Tensor, "t"]:
         ratio = torch.exp(logp - logp_old)
@@ -64,8 +71,8 @@ class PPO(torch.nn.Module):
     def compute_vf_loss(self, value: Float[torch.Tensor, "t"], advantage: Float[torch.Tensor, "t"], value_old: Float[torch.Tensor, "t"]) -> Float[torch.Tensor, "t"]:
         return (value - (advantage + value_old))**2
 
-    def compute_loss(self, clip_loss: Float[torch.Tensor, "t"], vf_loss: Float[torch.Tensor, "t"]) -> Float[torch.Tensor, "loss"]:
-        return -torch.mean(clip_loss - self.c1 * vf_loss)
+    def compute_loss(self, clip_loss: Float[torch.Tensor, "t"], vf_loss: Float[torch.Tensor, "t"], entropy: Float[torch.Tensor, "t"]) -> Float[torch.Tensor, "loss"]:
+        return -torch.mean(clip_loss - self.c1 * vf_loss + self.c2 * entropy)
 
 @hydra.main(version_base=None, config_path=".", config_name="config")
 def main(config):
@@ -75,7 +82,7 @@ def main(config):
     obs_dim = flatdim(env.observation_space)
     action_dim = flatdim(env.action_space)
 
-    obs, info = env.reset(seed=0)
+    obs = torch.as_tensor(env.reset(), device=device)
 
     model = PPO(
         device=device,
@@ -106,10 +113,10 @@ def main(config):
 
         with torch.no_grad():
             for t in range(config.timesteps_per_rollout):
-                action, logp, value = model.get_action(obs)
-                next_obs, reward, terminated, truncated, info = env.step(action.item())
+                action, logp, value = model.get_action(obs.unsqueeze(0))
+                next_obs, reward, done, info = env.step(action.item())
 
-                states[t] = torch.as_tensor(obs, device=device)
+                states[t] = obs.view(-1)
                 actions[t] = action.item()
                 logp_old[t] = logp.item()
                 values_old[t] = value.item()
@@ -124,16 +131,16 @@ def main(config):
                 ret_std = (ret_var + 1e-8) ** 0.5
                 rewards[t] = reward / ret_std
 
-                if terminated or truncated:
+                if done:
                     R = 0
                     mask[t] = 0
-                    obs, info = env.reset()
+                    obs = torch.as_tensor(env.reset(), device=device)
                 else:
                     mask[t] = 1
-                    obs = next_obs
+                    obs = torch.as_tensor(next_obs, device=device)
                 
                 total_timesteps += 1
-            _, _, value = model.get_action(obs)
+            _, _, value = model.get_action(obs.unsqueeze(0))
             values_old[config.timesteps_per_rollout] = value
 
             advantages = torch.empty(config.timesteps_per_rollout, device=device)
@@ -160,7 +167,7 @@ def main(config):
                 batch_advantages = advantages[batch_idx]
                 batch_advantages_norm = advantages_norm[batch_idx]
 
-                batch_logp, batch_value = model.evaluate_action(batch_states, batch_actions)
+                batch_logp, batch_entropy, batch_value = model.evaluate_action(batch_states, batch_actions)
 
                 clip_loss = model.compute_clip_loss(
                     logp=batch_logp,
@@ -172,7 +179,7 @@ def main(config):
                     advantage=batch_advantages,
                     value_old=batch_values_old
                 )
-                loss = model.compute_loss(clip_loss, vf_loss)
+                loss = model.compute_loss(clip_loss, vf_loss, batch_entropy)
                 kl = torch.mean(0.5 * (batch_logp - batch_logp_old) ** 2)
                 print(f"approximate kl: {kl}")
                 print(f"timestep: {total_timesteps}, epoch: {epoch}, loss: {loss}")
@@ -182,13 +189,12 @@ def main(config):
     # test final model
     print("testing final model")
     for k in range(5):
-        obs, info = env.reset()
+        obs = env.reset()
         done = False
         i = 0
         while not done:
-            action, logp, value = model.get_action(obs)
-            obs, reward, terminated, truncated, info = env.step(action.item())
-            done = terminated or truncated
+            action, logp, value = model.get_action(torch.as_tensor(obs, device=device).unsqueeze(0))
+            obs, reward, done, info = env.step(action.item())
             i += 1
         print(f"score: {i}")
 
