@@ -57,6 +57,8 @@ class PPO(torch.nn.Module):
 
     def compute_clip_loss(self, logp: Float[torch.Tensor, "t"], logp_old: Float[torch.Tensor, "t"], advantage: Float[torch.Tensor, "t"]) -> Float[torch.Tensor, "t"]:
         ratio = torch.exp(logp - logp_old)
+        clamped = ((ratio < 1 - self.epsilon).sum() + (ratio > 1 + self.epsilon).sum()).item()
+        print(f"percent clipped: {clamped * 100 / ratio.shape[0]}")
         return torch.minimum(ratio * advantage, torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantage)
     
     def compute_vf_loss(self, value: Float[torch.Tensor, "t"], advantage: Float[torch.Tensor, "t"], value_old: Float[torch.Tensor, "t"]) -> Float[torch.Tensor, "t"]:
@@ -85,6 +87,11 @@ def main(config):
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), config.lr)
 
+    R = 0
+    ret_count = 1e-4
+    ret_mean = 0
+    ret_M2 = 1e-4
+
     total_timesteps = 0
     while total_timesteps < config.total_timesteps:
         print("next rollout:")
@@ -96,6 +103,7 @@ def main(config):
         logp_old = torch.empty(config.timesteps_per_rollout, device=device)
         values_old = torch.empty(config.timesteps_per_rollout + 1, device=device)
         mask = torch.empty(config.timesteps_per_rollout, device=device)
+
         with torch.no_grad():
             for t in range(config.timesteps_per_rollout):
                 action, logp, value = model.get_action(obs)
@@ -103,11 +111,21 @@ def main(config):
 
                 states[t] = torch.as_tensor(obs, device=device)
                 actions[t] = action.item()
-                logp_old[t] = logp
-                values_old[t] = value
-                rewards[t] = reward
+                logp_old[t] = logp.item()
+                values_old[t] = value.item()
+
+                R = config.gamma * R + reward
+                ret_count = ret_count + 1.0
+                delta = R - ret_mean
+                ret_mean = ret_mean + delta / ret_count
+                delta2 = R - ret_mean
+                ret_M2 = ret_M2 + delta * delta2
+                ret_var = ret_M2 / ret_count
+                ret_std = (ret_var + 1e-8) ** 0.5
+                rewards[t] = reward / ret_std
 
                 if terminated or truncated:
+                    R = 0
                     mask[t] = 0
                     obs, info = env.reset()
                 else:
@@ -124,6 +142,8 @@ def main(config):
                 delta = rewards[t] + config.gamma * mask[t] * values_old[t+1] - values_old[t]
                 advantages[t] = delta + config.gamma * config.lam * mask[t] * advantage_next
                 advantage_next = advantages[t]
+            
+            advantages_norm = (advantages - torch.mean(advantages)) / (torch.std(advantages) + 1e-8)
 
         # update policy
         for epoch in range(config.epochs_per_rollout):
@@ -138,13 +158,14 @@ def main(config):
                 batch_logp_old = logp_old[batch_idx]
                 batch_values_old = values_old[batch_idx]
                 batch_advantages = advantages[batch_idx]
+                batch_advantages_norm = advantages_norm[batch_idx]
 
                 batch_logp, batch_value = model.evaluate_action(batch_states, batch_actions)
 
                 clip_loss = model.compute_clip_loss(
                     logp=batch_logp,
                     logp_old=batch_logp_old,
-                    advantage=batch_advantages
+                    advantage=batch_advantages_norm
                 )
                 vf_loss = model.compute_vf_loss(
                     value=batch_value,
@@ -152,20 +173,23 @@ def main(config):
                     value_old=batch_values_old
                 )
                 loss = model.compute_loss(clip_loss, vf_loss)
+                kl = torch.mean(0.5 * (batch_logp - batch_logp_old) ** 2)
+                print(f"approximate kl: {kl}")
                 print(f"timestep: {total_timesteps}, epoch: {epoch}, loss: {loss}")
                 loss.backward()
                 optimizer.step()
 
     # test final model
     print("testing final model")
-    obs, info = env.reset(seed=1)
-    done = False
-    i = 0
-    while not done:
-        action, logp, v = model.get_action(obs)
-        next_obs, r, terminated, truncated, info = env.step(action.item())
-        done = terminated or truncated
-        i += 1
+    for k in range(5):
+        obs, info = env.reset()
+        done = False
+        i = 0
+        while not done:
+            action, logp, value = model.get_action(obs)
+            obs, reward, terminated, truncated, info = env.step(action.item())
+            done = terminated or truncated
+            i += 1
         print(f"score: {i}")
 
 if __name__ == "__main__":

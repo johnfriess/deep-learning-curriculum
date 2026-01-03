@@ -1,4 +1,4 @@
-env: "CartPole-v1"
+env: "procgen:procgen-coinrun-v0"
 gamma: 0.99
 lam: 0.95
 timesteps_per_rollout: 2048
