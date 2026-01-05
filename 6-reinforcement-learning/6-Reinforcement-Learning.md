@@ -30,3 +30,4 @@ Note: this exercise may especially challenging, and it may help to start with a 
     - Policy entropy - This should fall gradually.
     - Value function explained variance (1 - Var[v_target - v_predicted] / Var[v_target]). This should quickly go above 0 and tend to something positive.
     - Mean and standard deviation used for advantage normalization. The estimates should be fairly stable and the mean should be pretty close to zero.
+
