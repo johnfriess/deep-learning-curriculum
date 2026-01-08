@@ -1,0 +1,5 @@
+transformer_epochs: 5
+rlhf_epochs: 1
+transformer_data_path: data/shakespeare.txt
+rlhf_data_path: data/rlhf.jsonl
+seq_len: 32
