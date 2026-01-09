@@ -60,7 +60,7 @@ class Transformer(torch.nn.Module):
         self.linear = torch.nn.Linear(d_model, vocab_size)
         self.sentiment = torch.nn.Linear(d_model, 1)
 
-    def forward(self, x: Int[torch.Tensor, "batch token"]) -> tuple[Float[torch.Tensor, "token d_model"], Float[torch.Tensor, "sentiment"]]:
+    def forward(self, x: Int[torch.Tensor, "batch token"]) -> tuple[Float[torch.Tensor, "batch token vocab_size"], Float[torch.Tensor, "sentiment"]]:
         x = self.embedding(x)
         x = x + self.pos_embedding(x)
 
@@ -80,72 +80,12 @@ class Transformer(torch.nn.Module):
         pos_embedding = torch.where(j % 2 == 0, torch.sin(i / torch.pow(10000, j/d_model)), torch.cos(i / torch.pow(10000, (j-1)/d_model)))
         return pos_embedding
     
-class PPO(torch.nn.Module):
-    def __init__(self, device=None, obs_dim=4, hidden_dim=64, action_dim=2, epsilon=0.2, c1=0.5, c2=0.01):
-        super().__init__()
-        self.device = device
-        self.epsilon = epsilon
-        self.c1 = c1
-        self.c2 = c2
-        self.encoder = torch.nn.Sequential(
-            torch.nn.Linear(obs_dim, hidden_dim),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden_dim, hidden_dim),
-            torch.nn.ReLU()
-        )
-        self.policy = torch.nn.Linear(hidden_dim, action_dim)
-        self.value = torch.nn.Linear(hidden_dim, 1)
-
-    def forward(self, state: Float[torch.Tensor, "batch obs_dim1 obs_dim2 ..."]) -> Float[torch.Tensor, "batch hidden_dim"]:
-        if not isinstance(state, torch.Tensor):
-            state = torch.as_tensor(state, device=self.device)
-        if state.dtype != torch.float:
-            state = state.float()
-        if state.ndim == 1:
-            state = state.unsqueeze(0)
-        if state.dtype == torch.uint8:
-            state = state / 255.0
-        B = state.shape[0]
-        state = state.view(B, -1)
-        return self.encoder(state)
-
-    def get_policy(self, state: Float[torch.Tensor, "batch obs_dim1 obs_dim2 ..."]) -> Float[torch.Tensor, "batch action_dim"]:
-        state = self.forward(state)
-        return self.policy(state)
-
-    def get_action(self, state: Float[torch.Tensor, "batch obs_dim1 obs_dim2 ..."]) -> tuple[Float[torch.Tensor, "batch"], Float[torch.Tensor, "batch"], Float[torch.Tensor, "batch"]]:
-        state = self.forward(state)
-        logits = self.policy(state)
-        probs = torch.softmax(logits, dim=1).clamp_min(1e-8)
-
-        action = torch.multinomial(probs, num_samples=1).squeeze(-1)
-        logp = torch.log(probs.gather(dim=1, index=action.unsqueeze(-1))).squeeze(-1)
-        value = self.value(state).squeeze(-1)
-
-        return action, logp, value
-    
-    def evaluate_action(self, state: Float[torch.Tensor, "batch obs_dim1 obs_dim2 ..."], action: Float[torch.Tensor, "batch"]) -> tuple[Float[torch.Tensor, "batch"], Float[torch.Tensor, "batch"], Float[torch.Tensor, "batch"]]:
-        state = self.forward(state)
-        logits = self.policy(state)
-        probs = torch.softmax(logits, dim=1).clamp_min(1e-8)
-        entropy = -torch.sum(probs * torch.log(probs), dim=1)
-
-        logp = torch.log(probs.gather(dim=1, index=action.unsqueeze(-1))).squeeze(-1)
-        value = self.value(state).squeeze(-1)
-
-        return logp, entropy, value
-
     def compute_clip_loss(self, logp: Float[torch.Tensor, "t"], logp_old: Float[torch.Tensor, "t"], advantage: Float[torch.Tensor, "t"]) -> Float[torch.Tensor, "t"]:
         ratio = torch.exp(logp - logp_old)
         clamped = ((ratio < 1 - self.epsilon).sum() + (ratio > 1 + self.epsilon).sum()).item()
         print(f"percent clipped: {clamped * 100 / ratio.shape[0]}")
         return torch.minimum(ratio * advantage, torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantage)
-    
-    def compute_vf_loss(self, value: Float[torch.Tensor, "t"], advantage: Float[torch.Tensor, "t"], value_old: Float[torch.Tensor, "t"]) -> Float[torch.Tensor, "t"]:
-        return (value - (advantage + value_old))**2
 
-    def compute_loss(self, clip_loss: Float[torch.Tensor, "t"], vf_loss: Float[torch.Tensor, "t"], entropy: Float[torch.Tensor, "t"]) -> Float[torch.Tensor, "loss"]:
-        return -torch.mean(clip_loss - self.c1 * vf_loss + self.c2 * entropy)
 
 PAD = "<pad>"
 UNK = "<unk>"
@@ -199,26 +139,27 @@ def main(config):
     vocab_size = len(stoi)
 
     model = Transformer(d_model=32, d_k=12, d_v=12, n_heads=4, vocab_size=vocab_size)
-    optimizer = torch.optim.Adam(model.parameters())
+    model_optimizer = torch.optim.Adam(model.parameters())
 
     model.train()
-    # for epoch in range(config.transformer_epochs):
-    #     print(f"training epoch {epoch}")
-    #     for i in range(0, len(tokens), config.seq_len):
-    #         print(f"training seq start {i}")
-    #         start, end = i, i+config.seq_len
-    #         if end > len(tokens):
-    #             continue
+    for epoch in range(config.transformer_epochs):
+        print(f"training epoch {epoch}")
+        for i in range(0, len(tokens), config.seq_len):
+            print(f"training seq start {i}")
+            start, end = i, i+config.seq_len
+            if end > len(tokens):
+                continue
             
-    #         seq = torch.as_tensor(numericalize(tokens[start:end], stoi))
-    #         inputs = seq[:-1]
-    #         targets = seq[1:]
+            seq = torch.as_tensor(numericalize(tokens[start:end], stoi))
+            inputs = seq[:-1]
+            targets = seq[1:]
 
-    #         optimizer.zero_grad()
-    #         logits = model(inputs)
-    #         loss = torch.nn.functional.cross_entropy(logits, targets)
-    #         loss.backward()
-    #         optimizer.step()
+            model_optimizer.zero_grad()
+            logits = model(inputs)
+            loss = torch.nn.functional.cross_entropy(logits, targets)
+            loss.backward()
+            model_optimizer.step()
+
 
     # train reward model for RLHF
     with open(config.rlhf_data_path, 'r') as f:
@@ -230,22 +171,23 @@ def main(config):
         "sad": 0.0
     }
 
-    optimizer = torch.optim.Adam(model.sentiment.parameters())
+    sentiment_optimizer = torch.optim.Adam(model.sentiment.parameters())
     for epoch in range(config.rlhf_epochs):
         print(f"training reward model epoch {epoch}")
         rlhf_data_loader = DataLoader(rlhf_data, batch_size=config.batch_size, shuffle=True)
         for samples, sentiments in rlhf_data_loader:
-            print("run")
             targets = torch.tensor([rlhf_labels[sentiment] for sentiment in sentiments], device=device)
             seq = torch.tensor(add_padding(batch_numericalize(batch_tokenize(samples), stoi), stoi), device=device)
 
-            optimizer.zero_grad()
+            sentiment_optimizer.zero_grad()
             _, sentiment_logit = model(seq)
             loss = torch.nn.functional.binary_cross_entropy_with_logits(sentiment_logit, targets)
             loss.backward()
-            optimizer.step()
+            sentiment_optimizer.step()
 
+    # test reward model
     model.eval()
+    optimizer = torch.optim.Adam(model.parameters())
     with torch.no_grad():
         samples = [
             "\nThat in the natures of their lords rebel;\nBring oil to fire, snow to their colder moods;\nRenege, affirm, and turn their halcyon beaks\nWith every gale and vary of their masters,\nKnowing naught, like dogs, but following.",
@@ -258,33 +200,78 @@ def main(config):
         prob = torch.sigmoid(sentiment_logit)
         print(prob)
 
-    exit()
-    model.eval()
-    with torch.no_grad():
-        # test auto-regressiveness
-        for _ in range(1):
-            start = ["In", "singleness", "the", "parts", "that", "thou"]
-            for _ in range(1):
-                x = torch.as_tensor(numericalize(start, stoi))
-                logits = model(x)
-                probs = torch.softmax(logits[-1], dim=-1)
-                topk = torch.topk(probs, 20)
-                print([(itos[i.item()], float(p)) for i, p in zip(topk.indices, topk.values)])
-                next_word = itos[torch.multinomial(probs, 1).item()]
-                start.append(next_word)
-            print(start)
 
-        # test predictions on sequences
-        for i in range(1000, 1100, seq_len):
-            start, end = i, i+seq_len
-            if end > len(tokens):
-                continue
+    # fine tune model
+    model.train()
 
-            x = torch.as_tensor(numericalize(tokens[start:end], stoi))
-            logits = model(x)
-            probs = torch.softmax(logits[-1], dim=-1)
-            next_word = itos[torch.multinomial(probs, 1).item()]
-            print(f"sequence: {" ".join(tokens[start:end])}, predicted: {next_word}")
+    completions = torch.empty(config.num_seq, config.seq_len, device=device)
+    logp_old = torch.empty(config.num_seq, config.seq_len, device=device)
+    advantages = torch.empty(config.num_seq, config.seq_len, device=device)
+
+    total_steps = 0
+    while total_steps < config.total_steps:
+        # collect different trajectories
+        with torch.no_grad():
+            for t in range(config.seq_len):
+                inputs = completions[:, :t]
+                logits, sentiment_logit = model(inputs)
+                logp_old[t] = torch.log_softmax(logits[:, -1], dim=-1)
+                completions[t] = torch.multinomial(probs, 1)
+                advantages[t] = torch.log(torch.sigmoid(sentiment_logit).clamp_min(1e-8))
+
+        # update params
+        for epoch in range(config.epochs_per_rollout):
+            idx = torch.randperm(config.num_seq * config.seq_len, device=device)
+            batch_size = (config.num_seq * config.seq_len) // config.minibatches_per_rollout
+            for start in range(0, config.num_seq * config.seq_len, batch_size):
+                model_optimizer.zero_grad()
+
+                batch_idx = idx[start:start + batch_size]
+                batch_seq_num = [i // config.seq_num for i in batch_idx]
+                batch_seq_len = [i % config.seq_num for i in batch_idx]
+
+                batch_completions = completions[batch_seq_num, :batch_seq_len] # need to add padding
+                batch_logp_old = logp_old[batch_seq_num, batch_seq_len]
+                batch_advantages = advantages[batch_seq_num, batch_seq_len]
+
+                logits, _ = model(batch_completions)
+                batch_logp = torch.log_softmax(logits[:, -1], dim=-1)
+
+                loss = model.compute_clip_loss(
+                    logp=batch_logp,
+                    logp_old=batch_logp_old,
+                    advantage=batch_advantages
+                )
+                loss.backward()
+                model_optimizer.step()
+
+    
+    # model.eval()
+    # with torch.no_grad():
+    #     # test auto-regressiveness
+    #     for _ in range(1):
+    #         start = ["In", "singleness", "the", "parts", "that", "thou"]
+    #         for _ in range(1):
+    #             x = torch.as_tensor(numericalize(start, stoi))
+    #             logits = model(x)
+    #             probs = torch.softmax(logits[-1], dim=-1)
+    #             topk = torch.topk(probs, 20)
+    #             print([(itos[i.item()], float(p)) for i, p in zip(topk.indices, topk.values)])
+    #             next_word = itos[torch.multinomial(probs, 1).item()]
+    #             start.append(next_word)
+    #         print(start)
+
+    #     # test predictions on sequences
+    #     for i in range(1000, 1100, seq_len):
+    #         start, end = i, i+seq_len
+    #         if end > len(tokens):
+    #             continue
+
+    #         x = torch.as_tensor(numericalize(tokens[start:end], stoi))
+    #         logits = model(x)
+    #         probs = torch.softmax(logits[-1], dim=-1)
+    #         next_word = itos[torch.multinomial(probs, 1).item()]
+    #         print(f"sequence: {" ".join(tokens[start:end])}, predicted: {next_word}")
 
 if __name__ == "__main__":
     main()

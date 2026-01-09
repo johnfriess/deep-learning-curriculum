@@ -4,3 +4,6 @@ transformer_data_path: "data/shakespeare.txt"
 rlhf_data_path: "data/rlhf.jsonl"
 seq_len: 32
 batch_size: 8
+num_seq: 256
+epochs_per_rollout: 3
+minibatches_per_rollout: 8
