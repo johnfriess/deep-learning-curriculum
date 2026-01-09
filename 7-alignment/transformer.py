@@ -216,7 +216,7 @@ def main(config):
                 inputs = completions[:, :t]
                 logits, sentiment_logit = model(inputs)
                 logp_old[t] = torch.log_softmax(logits[:, -1], dim=-1)
-                completions[t] = torch.multinomial(probs, 1)
+                completions[t] = torch.multinomial(logp_old[t], 1)
                 advantages[t] = torch.log(torch.sigmoid(sentiment_logit).clamp_min(1e-8))
 
         # update params
