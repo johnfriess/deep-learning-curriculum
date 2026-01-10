@@ -170,9 +170,8 @@ def main(config):
 
     model.train()
     for epoch in range(config.transformer_epochs):
-        print(f"training epoch {epoch}")
+        print(f"training transformer epoch {epoch}")
         for i in range(0, len(tokens), config.seq_len):
-            print(f"training seq start {i}")
             start, end = i, i+config.seq_len
             if end > len(tokens):
                 continue
@@ -284,6 +283,7 @@ def main(config):
 
         # update params
         for epoch in range(config.epochs_per_rollout):
+            print(f"finetuning model step {total_steps}, epoch {epoch}")
             idx = torch.randperm(config.num_seq, device=device)
             batch_size = config.num_seq // config.minibatches_per_rollout
             for start in range(0, config.num_seq, batch_size):
