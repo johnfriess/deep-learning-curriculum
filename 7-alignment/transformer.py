@@ -3,8 +3,10 @@ import torch
 import hydra
 import json
 import re
+import os
 from jaxtyping import Int, Float
 from torch.utils.data import DataLoader
+from copy import deepcopy
 
 class Attention(torch.nn.Module):
     def __init__(self, d_model=64, d_k=16, d_v=16, n_heads=1):
@@ -48,10 +50,11 @@ class FFN(torch.nn.Module):
         return x
 
 class Transformer(torch.nn.Module):
-    def __init__(self, n_layers=1, d_model=64, d_k=16, d_v=16, n_heads=1, vocab_size=5000):
+    def __init__(self, n_layers=1, d_model=64, d_k=16, d_v=16, n_heads=1, vocab_size=5000, epsilon=0.2, pad_id=None):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
+        self.pad_id = pad_id
         self.embedding = torch.nn.Embedding(vocab_size, d_model)
         self.attention = Attention(d_model, d_k, d_v, n_heads)
         self.ln1 = torch.nn.LayerNorm(d_model)
@@ -59,22 +62,33 @@ class Transformer(torch.nn.Module):
         self.ln2 = torch.nn.LayerNorm(d_model)
         self.linear = torch.nn.Linear(d_model, vocab_size)
         self.sentiment = torch.nn.Linear(d_model, 1)
+        self.epsilon = epsilon
 
-    def forward(self, x: Int[torch.Tensor, "batch token"]) -> tuple[Float[torch.Tensor, "batch token vocab_size"], Float[torch.Tensor, "sentiment"]]:
-        x = self.embedding(x)
+    def forward(self, x_ids: Int[torch.Tensor, "batch token"]) -> tuple[Float[torch.Tensor, "batch token vocab_size"], Float[torch.Tensor, "sentiment"]]:
+        B, T = x_ids.shape
+        x = self.embedding(x_ids)
         x = x + self.pos_embedding(x)
 
         x = self.ln1(x + self.attention(x, x, x))
         x = self.ln2(x + self.ffn(x))
         logits = self.linear(x)
-        sentiment = self.sentiment(x[:, -1]).squeeze(-1)
+        
+        if self.pad_id is None:
+            last_h = x[:, -1]
+        else:
+            # last real token index per row
+            lengths = (x_ids != self.pad_id).sum(dim=1).clamp_min(1)
+            last_idx = lengths - 1
+            last_h = x[torch.arange(B, device=x.device), last_idx]
+
+        sentiment = self.sentiment(last_h).squeeze(-1)
         return logits, sentiment
 
     def pos_embedding(self, x: Float[torch.Tensor, "batch token d_model"]) -> Float[torch.Tensor, "token d_model"]:
         B, n, d_model = x.shape
         i, j = torch.meshgrid(
-            torch.arange(n),
-            torch.arange(d_model),
+            torch.arange(n, device=x.device),
+            torch.arange(d_model, device=x.device),
             indexing="ij"
         )
         pos_embedding = torch.where(j % 2 == 0, torch.sin(i / torch.pow(10000, j/d_model)), torch.cos(i / torch.pow(10000, (j-1)/d_model)))
@@ -84,11 +98,12 @@ class Transformer(torch.nn.Module):
         ratio = torch.exp(logp - logp_old)
         clamped = ((ratio < 1 - self.epsilon).sum() + (ratio > 1 + self.epsilon).sum()).item()
         print(f"percent clipped: {clamped * 100 / ratio.shape[0]}")
-        return torch.minimum(ratio * advantage, torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantage)
+        return -torch.mean(torch.minimum(ratio * advantage, torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantage))
 
 
 PAD = "<pad>"
 UNK = "<unk>"
+BOS = "<bos>"
 
 def tokenize(text: str):
     tokens = re.split(r"\b", text)
@@ -105,7 +120,7 @@ def build_vocab(tokens, min_freq=1):
     for token in tokens:
         cnt[token] = cnt.get(token, 0) + 1
     
-    vocab = [PAD, UNK] + [t for t, c in cnt.items() if c >= min_freq and t not in (PAD, UNK)]
+    vocab = [PAD, UNK, BOS] + [t for t, c in cnt.items() if c >= min_freq and t not in (PAD, UNK)]
     stoi = {t:i for i,t in enumerate(vocab)}
     itos = {i:t for t,i in stoi.items()}
     return stoi, itos
@@ -120,6 +135,9 @@ def batch_numericalize(batch_tokens, stoi):
 
 def add_padding(batch_tokens, stoi):
     max_len = max([len(batch) for batch in batch_tokens])
+    return add_padding_to_len(batch_tokens, stoi, max_len)
+
+def add_padding_to_len(batch_tokens, stoi, max_len):
     pad_id = stoi[PAD]
     for batch in batch_tokens:
         while len(batch) < max_len:
@@ -138,7 +156,7 @@ def main(config):
     stoi, itos = build_vocab(tokens)
     vocab_size = len(stoi)
 
-    model = Transformer(d_model=32, d_k=12, d_v=12, n_heads=4, vocab_size=vocab_size)
+    model = Transformer(d_model=32, d_k=12, d_v=12, n_heads=4, vocab_size=vocab_size, epsilon=config.epsilon, pad_id=stoi[PAD]).to(device)
     model_optimizer = torch.optim.Adam(model.parameters())
 
     model.train()
@@ -150,17 +168,27 @@ def main(config):
             if end > len(tokens):
                 continue
             
-            seq = torch.as_tensor(numericalize(tokens[start:end], stoi))
-            inputs = seq[:-1]
-            targets = seq[1:]
+            seq = torch.as_tensor(numericalize([BOS] + tokens[start:end], stoi), device=device)
+            inputs = seq[:-1].unsqueeze(0)
+            targets = seq[1:].unsqueeze(0)
 
             model_optimizer.zero_grad()
-            logits = model(inputs)
-            loss = torch.nn.functional.cross_entropy(logits, targets)
+            logits, _ = model(inputs)
+            loss = torch.nn.functional.cross_entropy(logits.squeeze(0), targets.squeeze(0))
             loss.backward()
             model_optimizer.step()
+    
+    os.makedirs("checkpoints", exist_ok=True)
+    torch.save({
+            "model": model.state_dict(),
+            "stoi": stoi,
+            "itos": itos,
+            "config": dict(config)
+        },
+        "checkpoints/policy_base.pt"
+    )
 
-
+    exit()
     # train reward model for RLHF
     with open(config.rlhf_data_path, 'r') as f:
         data = [json.loads(line) for line in f if line.strip()]
@@ -185,57 +213,73 @@ def main(config):
             loss.backward()
             sentiment_optimizer.step()
 
-    # test reward model
-    model.eval()
-    optimizer = torch.optim.Adam(model.parameters())
-    with torch.no_grad():
-        samples = [
-            "\nThat in the natures of their lords rebel;\nBring oil to fire, snow to their colder moods;\nRenege, affirm, and turn their halcyon beaks\nWith every gale and vary of their masters,\nKnowing naught, like dogs, but following.",
-            "\nVengeance! plague! death! confusion!",
-            "\nRive your concealing continents, and cry\nThese dreadful summoners grace. I am a man\nMore sinn’d against than sinning."
-        ]
-        seq = torch.tensor(add_padding(batch_numericalize(batch_tokenize(samples), stoi), stoi), device=device)
-        print(seq.shape)
-        _, sentiment_logit = model(seq)
-        prob = torch.sigmoid(sentiment_logit)
-        print(prob)
+    # # test reward model
+    # model.eval()
+    # optimizer = torch.optim.Adam(model.parameters())
+    # with torch.no_grad():
+    #     samples = [
+    #         "\nThat in the natures of their lords rebel;\nBring oil to fire, snow to their colder moods;\nRenege, affirm, and turn their halcyon beaks\nWith every gale and vary of their masters,\nKnowing naught, like dogs, but following.",
+    #         "\nVengeance! plague! death! confusion!",
+    #         "\nRive your concealing continents, and cry\nThese dreadful summoners grace. I am a man\nMore sinn’d against than sinning."
+    #     ]
+    #     seq = torch.tensor(add_padding(batch_numericalize(batch_tokenize(samples), stoi), stoi), device=device)
+    #     print(seq.shape)
+    #     _, sentiment_logit = model(seq)
+    #     prob = torch.sigmoid(sentiment_logit)
+    #     print(prob)
 
 
     # fine tune model
-    model.train()
+    policy = model
+    reward_model = deepcopy(model)
+    for p in reward_model.parameters():
+        p.requires_grad = False
 
-    completions = torch.empty(config.num_seq, config.seq_len, device=device)
-    logp_old = torch.empty(config.num_seq, config.seq_len, device=device)
-    advantages = torch.empty(config.num_seq, config.seq_len, device=device)
+    model.train()
+    reward_model.eval()
 
     total_steps = 0
     while total_steps < config.total_steps:
+        completions = torch.empty(config.num_seq, config.seq_len, dtype=torch.long, device=device)
+        completions[:, 0] = stoi[BOS]
+        logp_old = torch.empty(config.num_seq, config.seq_len-1, device=device) # ignore BOS token in start of seq
+        advantages = torch.empty()
+
         # collect different trajectories
         with torch.no_grad():
-            for t in range(config.seq_len):
+            for t in range(1, config.seq_len):
                 inputs = completions[:, :t]
-                logits, sentiment_logit = model(inputs)
-                logp_old[t] = torch.log_softmax(logits[:, -1], dim=-1)
-                completions[t] = torch.multinomial(logp_old[t], 1)
-                advantages[t] = torch.log(torch.sigmoid(sentiment_logit).clamp_min(1e-8))
+                logits, _ = policy(inputs)
+                probs = torch.softmax(logits[:, -1], dim=-1) # B, vocab_size
+                next_tokens = torch.multinomial(probs, 1) # B, 1
+                next_tokens_probs = probs.gather(dim=-1, idx=next_tokens) # B, 1
+
+                completions[:, t] = next_tokens.squeeze(-1) # B, T
+                logp_old[:, t-1] = torch.log(next_tokens_probs.squeeze(-1).clamp_min(1e-8)) # B, T
+
+                total_steps += 1
+            _, sentiment_logit = reward_model(completions)
+            advantages = torch.log(torch.sigmoid(sentiment_logit.unsqueeze(-1)).clamp_min(1e-8)) # B, 1
 
         # update params
         for epoch in range(config.epochs_per_rollout):
-            idx = torch.randperm(config.num_seq * config.seq_len, device=device)
-            batch_size = (config.num_seq * config.seq_len) // config.minibatches_per_rollout
-            for start in range(0, config.num_seq * config.seq_len, batch_size):
+            idx = torch.randperm(config.num_seq, device=device)
+            batch_size = config.num_seq // config.minibatches_per_rollout
+            for start in range(0, config.num_seq, batch_size):
                 model_optimizer.zero_grad()
 
                 batch_idx = idx[start:start + batch_size]
-                batch_seq_num = [i // config.seq_num for i in batch_idx]
-                batch_seq_len = [i % config.seq_num for i in batch_idx]
+                batch_completions = completions[batch_idx]
+                batch_logp_old = logp_old[batch_idx]
+                batch_advantages = advantages[batch_idx]
 
-                batch_completions = completions[batch_seq_num, :batch_seq_len] # need to add padding
-                batch_logp_old = logp_old[batch_seq_num, batch_seq_len]
-                batch_advantages = advantages[batch_seq_num, batch_seq_len]
+                inputs = batch_completions[:, :-1] # ignore last token
+                logits, _ = model(inputs) # B, T, V
+                probs = torch.softmax(logits, dim=-1)
 
-                logits, _ = model(batch_completions)
-                batch_logp = torch.log_softmax(logits[:, -1], dim=-1)
+                next_tokens = batch_completions[:, 1:].unsqueeze(-1) # B, T, 1
+                next_tokens_probs = probs.gather(dim=-1, idx=next_tokens) # B, T, 1
+                batch_logp = torch.log(next_tokens_probs.squeeze(-1).clamp_min(1e-8)) # B, T
 
                 loss = model.compute_clip_loss(
                     logp=batch_logp,
