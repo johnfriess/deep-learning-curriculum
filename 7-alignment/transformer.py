@@ -214,7 +214,9 @@ def main(config):
         rlhf_data_loader = DataLoader(rlhf_data, batch_size=config.batch_size, shuffle=True)
         for samples, sentiments in rlhf_data_loader:
             targets = torch.tensor([rlhf_labels[sentiment] for sentiment in sentiments], device=device)
-            seq = torch.tensor(add_padding(batch_numericalize(batch_tokenize(samples), stoi), stoi), device=device)
+            batch_tokens = batch_numericalize(batch_tokenize(samples), stoi)
+            batch_tokens = [[stoi[BOS] + tokens for tokens in batch_tokens]]
+            seq = torch.tensor(add_padding(batch_tokens, stoi), device=device)
 
             sentiment_optimizer.zero_grad()
             _, sentiment_logit = model(seq)
@@ -279,7 +281,7 @@ def main(config):
 
                 total_steps += 1
             _, sentiment_logit = reward_model(completions)
-            advantages = torch.log(torch.sigmoid(sentiment_logit.unsqueeze(-1)).clamp_min(1e-8)) # B, 1
+            advantages = (torch.log(torch.sigmoid(sentiment_logit.unsqueeze(-1)).clamp_min(1e-8)) - (-0.66)) / 0.16 # B, 1
 
         # update params
         for epoch in range(config.epochs_per_rollout):
