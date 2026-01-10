@@ -156,7 +156,16 @@ def main(config):
     stoi, itos = build_vocab(tokens)
     vocab_size = len(stoi)
 
-    model = Transformer(d_model=32, d_k=12, d_v=12, n_heads=4, vocab_size=vocab_size, epsilon=config.epsilon, pad_id=stoi[PAD]).to(device)
+    model_kwargs = dict(
+        d_model=32,
+        d_k=12,
+        d_v=12,
+        n_heads=4,
+        vocab_size=vocab_size,
+        epsilon=config.epsilon,
+        pad_id=stoi[PAD],
+    )
+    model = Transformer(**model_kwargs).to(device)
     model_optimizer = torch.optim.Adam(model.parameters())
 
     model.train()
@@ -179,13 +188,15 @@ def main(config):
             model_optimizer.step()
     
     os.makedirs("checkpoints", exist_ok=True)
-    torch.save({
+    torch.save(
+        {
             "model": model.state_dict(),
+            "model_kwargs": model_kwargs,
             "stoi": stoi,
             "itos": itos,
-            "config": dict(config)
+            "config": dict(config),
         },
-        "checkpoints/policy_base.pt"
+        "checkpoints/policy_base.pt",
     )
 
     # train reward model for RLHF
@@ -212,13 +223,15 @@ def main(config):
             loss.backward()
             sentiment_optimizer.step()
 
-    torch.save({
+    torch.save(
+        {
             "model": model.state_dict(),
+            "model_kwargs": model_kwargs,
             "stoi": stoi,
             "itos": itos,
-            "config": dict(config)
+            "config": dict(config),
         },
-        "checkpoints/reward_model.pt"
+        "checkpoints/reward_model.pt",
     )
 
     # # test reward model
@@ -297,13 +310,15 @@ def main(config):
                 loss.backward()
                 model_optimizer.step()
 
-    torch.save({
+    torch.save(
+        {
             "model": policy.state_dict(),
+            "model_kwargs": model_kwargs,
             "stoi": stoi,
             "itos": itos,
-            "config": dict(config)
+            "config": dict(config),
         },
-        "checkpoints/policy_finetune.pt"
+        "checkpoints/policy_finetune.pt",
     )
 
 

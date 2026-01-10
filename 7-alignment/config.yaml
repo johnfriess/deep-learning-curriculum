@@ -1,10 +1,11 @@
-transformer_epochs: 1
-rlhf_epochs: 3
 transformer_data_path: "data/shakespeare.txt"
 rlhf_data_path: "data/rlhf.jsonl"
-seq_len: 1000
-batch_size: 8
-num_seq: 256
-epochs_per_rollout: 3
-minibatches_per_rollout: 8
+seq_len: 64
 epsilon: 0.2
+transformer_epochs: 1  # smoke test; increase to 3-10 for better base model
+rlhf_epochs: 2         # smoke test; increase to 5-20 depending on labels
+batch_size: 16         # reward model supervised batches
+num_seq: 64                    # number of completions per rollout batch
+epochs_per_rollout: 2          # PPO epochs over the rollout data
+minibatches_per_rollout: 4     # PPO minibatches per epoch
+total_steps: 1260
