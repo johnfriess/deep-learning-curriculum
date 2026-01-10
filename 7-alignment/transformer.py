@@ -321,8 +321,6 @@ def main(config):
         "checkpoints/policy_finetune.pt",
     )
 
-
-
     # model.eval()
     # with torch.no_grad():
     #     # test auto-regressiveness
