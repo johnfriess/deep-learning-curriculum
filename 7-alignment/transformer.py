@@ -188,7 +188,6 @@ def main(config):
         "checkpoints/policy_base.pt"
     )
 
-    exit()
     # train reward model for RLHF
     with open(config.rlhf_data_path, 'r') as f:
         data = [json.loads(line) for line in f if line.strip()]
