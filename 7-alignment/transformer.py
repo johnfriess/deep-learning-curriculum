@@ -260,7 +260,7 @@ def main(config):
                 logits, _ = policy(inputs)
                 probs = torch.softmax(logits[:, -1], dim=-1) # B, vocab_size
                 next_tokens = torch.multinomial(probs, 1) # B, 1
-                next_tokens_probs = probs.gather(dim=-1, idx=next_tokens) # B, 1
+                next_tokens_probs = probs.gather(dim=-1, index=next_tokens) # B, 1
 
                 completions[:, t] = next_tokens.squeeze(-1) # B, T
                 logp_old[:, t-1] = torch.log(next_tokens_probs.squeeze(-1).clamp_min(1e-8)) # B, T
@@ -286,7 +286,7 @@ def main(config):
                 probs = torch.softmax(logits, dim=-1)
 
                 next_tokens = batch_completions[:, 1:].unsqueeze(-1) # B, T, 1
-                next_tokens_probs = probs.gather(dim=-1, idx=next_tokens) # B, T, 1
+                next_tokens_probs = probs.gather(dim=-1, index=next_tokens) # B, T, 1
                 batch_logp = torch.log(next_tokens_probs.squeeze(-1).clamp_min(1e-8)) # B, T
 
                 loss = policy.compute_clip_loss(
