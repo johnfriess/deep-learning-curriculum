@@ -97,7 +97,7 @@ class Transformer(torch.nn.Module):
     def compute_clip_loss(self, logp: Float[torch.Tensor, "t"], logp_old: Float[torch.Tensor, "t"], advantage: Float[torch.Tensor, "t"]) -> Float[torch.Tensor, "t"]:
         ratio = torch.exp(logp - logp_old)
         clamped = ((ratio < 1 - self.epsilon).sum() + (ratio > 1 + self.epsilon).sum()).item()
-        print(f"percent clipped: {clamped * 100 / ratio.shape[0]}")
+        #print(f"percent clipped: {clamped * 100 / ratio.shape[0]}")
         return -torch.mean(torch.minimum(ratio * advantage, torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantage))
 
 
