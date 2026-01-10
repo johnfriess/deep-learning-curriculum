@@ -212,6 +212,15 @@ def main(config):
             loss.backward()
             sentiment_optimizer.step()
 
+    torch.save({
+            "model": model.state_dict(),
+            "stoi": stoi,
+            "itos": itos,
+            "config": dict(config)
+        },
+        "checkpoints/reward_model.pt"
+    )
+
     # # test reward model
     # model.eval()
     # optimizer = torch.optim.Adam(model.parameters())
@@ -230,11 +239,11 @@ def main(config):
 
     # fine tune model
     policy = model
-    reward_model = deepcopy(model)
+    reward_model = deepcopy(model).to(device)
     for p in reward_model.parameters():
         p.requires_grad = False
 
-    model.train()
+    policy.train()
     reward_model.eval()
 
     total_steps = 0
@@ -242,7 +251,7 @@ def main(config):
         completions = torch.empty(config.num_seq, config.seq_len, dtype=torch.long, device=device)
         completions[:, 0] = stoi[BOS]
         logp_old = torch.empty(config.num_seq, config.seq_len-1, device=device) # ignore BOS token in start of seq
-        advantages = torch.empty()
+        advantages = None
 
         # collect different trajectories
         with torch.no_grad():
@@ -273,14 +282,14 @@ def main(config):
                 batch_advantages = advantages[batch_idx]
 
                 inputs = batch_completions[:, :-1] # ignore last token
-                logits, _ = model(inputs) # B, T, V
+                logits, _ = policy(inputs) # B, T, V
                 probs = torch.softmax(logits, dim=-1)
 
                 next_tokens = batch_completions[:, 1:].unsqueeze(-1) # B, T, 1
                 next_tokens_probs = probs.gather(dim=-1, idx=next_tokens) # B, T, 1
                 batch_logp = torch.log(next_tokens_probs.squeeze(-1).clamp_min(1e-8)) # B, T
 
-                loss = model.compute_clip_loss(
+                loss = policy.compute_clip_loss(
                     logp=batch_logp,
                     logp_old=batch_logp_old,
                     advantage=batch_advantages
@@ -288,7 +297,17 @@ def main(config):
                 loss.backward()
                 model_optimizer.step()
 
-    
+    torch.save({
+            "model": policy.state_dict(),
+            "stoi": stoi,
+            "itos": itos,
+            "config": dict(config)
+        },
+        "checkpoints/policy_finetune.pt"
+    )
+
+
+
     # model.eval()
     # with torch.no_grad():
     #     # test auto-regressiveness
