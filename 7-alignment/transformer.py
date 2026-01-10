@@ -215,7 +215,7 @@ def main(config):
         for samples, sentiments in rlhf_data_loader:
             targets = torch.tensor([rlhf_labels[sentiment] for sentiment in sentiments], device=device)
             batch_tokens = batch_numericalize(batch_tokenize(samples), stoi)
-            batch_tokens = [[stoi[BOS] + tokens for tokens in batch_tokens]]
+            batch_tokens = [[stoi[BOS]] + tokens for tokens in batch_tokens]
             seq = torch.tensor(add_padding(batch_tokens, stoi), device=device)
 
             sentiment_optimizer.zero_grad()
