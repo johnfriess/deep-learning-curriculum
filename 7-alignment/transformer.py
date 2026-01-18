@@ -262,6 +262,7 @@ def main(config):
 
     total_steps = 0
     while total_steps < config.total_steps:
+        print(f"finetuning model step {total_steps}")
         completions = torch.empty(config.num_seq, config.seq_len, dtype=torch.long, device=device)
         completions[:, 0] = stoi[BOS]
         logp_old = torch.empty(config.num_seq, config.seq_len-1, device=device) # ignore BOS token in start of seq
@@ -285,7 +286,6 @@ def main(config):
 
         # update params
         for epoch in range(config.epochs_per_rollout):
-            print(f"finetuning model step {total_steps}, epoch {epoch}")
             idx = torch.randperm(config.num_seq, device=device)
             batch_size = config.num_seq // config.minibatches_per_rollout
             for start in range(0, config.num_seq, batch_size):
